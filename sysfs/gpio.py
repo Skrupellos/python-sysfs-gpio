@@ -83,7 +83,7 @@ ACTIVE_LOW_MODES = (ACTIVE_LOW_ON, ACTIVE_LOW_OFF)
 
 
 class Pin(object):
-	def __init__(self, number, direction, callback=None, edge=None, active_low=ACTIVE_LOW_OFF):
+	def __init__(self, number, direction=INPUT, callback=None, edge=None, active_low=ACTIVE_LOW_OFF):
 		self._number = number
 		self._direction = direction
 		self._callback  = callback
@@ -107,6 +107,7 @@ class Pin(object):
 			with open(self._sysfs_gpio_active_low_path(), 'w') as fsactive_low:
 				fsactive_low.write(str(active_low))
 	
+	
 	@property
 	def callback(self):
 		return self._callback
@@ -115,46 +116,57 @@ class Pin(object):
 	def callback(self, value):
 		self._callback = value
 	
+	
 	@property
 	def direction(self):
 		return self._direction
+	
+	
+	@property
+	def value(self):
+		val = self._fd.read()
+		self._fd.seek(0)
+		return val == b'1\n'
+	
+	@callback.setter
+	def value(self, value):
+		self._fd.write(SYSFS_GPIO_VALUE_HIGH if value else SYSFS_GPIO_VALUE_LOW)
+		self._fd.seek(0)
+	
 	
 	@property
 	def number(self):
 		return self._number
 	
+	
 	@property
 	def active_low(self):
 		return self._active_low
 	
-	def set(self):
-		self._fd.write(SYSFS_GPIO_VALUE_HIGH)
-		self._fd.seek(0)
-	
-	def reset(self):
-		self._fd.write(SYSFS_GPIO_VALUE_LOW)
-		self._fd.seek(0)
-	
-	def read(self):
-		val = self._fd.read()
-		self._fd.seek(0)
-		return int(val)
 	
 	def fileno(self):
 		return self._fd.fileno()
+	
 	
 	def changed(self, state):
 		if callable(self._callback):
 			self._callback(self.number, state)
 	
+	
+	#####################
+	## Private Methods ##
+	#####################
 	def _sysfs_gpio_value_path(self):
 		return SYSFS_GPIO_VALUE_PATH % self.number
+	
 	
 	def _sysfs_gpio_direction_path(self):
 		return SYSFS_GPIO_DIRECTION_PATH % self.number
 	
+	
 	def _sysfs_gpio_edge_path(self):
 		return SYSFS_GPIO_EDGE_PATH % self.number
+	
 	
 	def _sysfs_gpio_active_low_path(self):
 		return SYSFS_GPIO_ACTIVE_LOW_PATH % self.number
