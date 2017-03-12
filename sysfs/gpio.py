@@ -28,15 +28,10 @@ __all__ = (
 	'INPUT', 'OUTPUT', 'DIRECTIONS',
 	'RISING', 'FALLING', 'BOTH', 'EDGES',
 	'ACTIVE_LOW_ON', 'ACTIVE_LOW_OFF', 'ACTIVE_LOW_MODES',
-	'Controller'
+	'pin'
 )
 
-import errno
 import os
-import select
-
-from twisted.internet import reactor
-
 import logging
 
 Logger = logging.getLogger('sysfs.gpio')
@@ -58,10 +53,6 @@ SYSFS_GPIO_EDGE_PATH       = SYSFS_GPIO_PATH + '/edge'
 SYSFS_GPIO_VALUE_PATH      = SYSFS_GPIO_PATH + '/value'
 SYSFS_GPIO_ACTIVE_LOW_PATH = SYSFS_GPIO_PATH + '/active_low'
 
-SYSFS_GPIO_VALUE_LOW   = '0'
-SYSFS_GPIO_VALUE_HIGH  = '1'
-
-EPOLL_TIMEOUT = 1  ## second
 
 
 ######################
@@ -81,119 +72,321 @@ ACTIVE_LOW_OFF = 0
 ACTIVE_LOW_MODES = (ACTIVE_LOW_ON, ACTIVE_LOW_OFF)
 
 
-
-class Pin(object):
-	def __init__(self, number, direction=INPUT, callback=None, edge=None, active_low=ACTIVE_LOW_OFF):
-		self._number = number
-		self._direction = direction
-		self._callback  = callback
-		self._active_low = active_low
+class Pin:
+	self __init__(self, nr, eventLoop = None):
+		if not isinstance(nr, int) or nr < 0:
+			raise TypeError('Not a valid GPIO number')
 		
-		self._fd = open(self._sysfs_gpio_value_path(), 'r+')
+		self.__nr = nr
+		self.eventLoop = eventLoop
 		
-		if callback and not edge:
-			raise Exception('You must supply a edge to trigger callback on')
+		self.__valueFile = None
+		self.__monitoring = None
+	
+	
+	############
+	## Export ##
+	############
+	def export(self):
+		with open(SYSFS_EXPORT_PATH, 'w') as f:
+			f.write('%d' % self.__nr)
+	
+	
+	def unexport(self):
+		self.__closeValueFile()
 		
-		with open(self._sysfs_gpio_direction_path(), 'w') as fsdir:
-			fsdir.write(direction)
-		
-		if edge:
-			with open(self._sysfs_gpio_edge_path(), 'w') as fsedge:
-				fsedge.write(edge)
-		
-		if active_low:
-			if active_low not in ACTIVE_LOW_MODES:
-				raise Exception('You must supply a value for active_low which is either 0 or 1.')
-			with open(self._sysfs_gpio_active_low_path(), 'w') as fsactive_low:
-				fsactive_low.write(str(active_low))
+		with open(SYSFS_UNEXPORT_PATH, 'w') as f:
+			f.write('%d' % self.__nr)
+	
+	
+	def exportedOrFail(self):
+		if not self.exported:
+			raise Exception('GPIO #%d is not exported' % self.__nr)
 	
 	
 	@property
-	def callback(self):
-		return self._callback
+	def exported(self):
+		return os.path.isdir(SYSFS_GPIO_PATH % self.__nr)
 	
-	@callback.setter
-	def callback(self, value):
-		self._callback = value
+	
+	@exported.setter
+	def exported(self, shouldBeExported):
+		if self.exported == shouldBeExported:
+			return
+		
+		if shouldBeExported == True:
+			self.export()
+		else if shouldBeExported == False:
+			self.unexport()
+		else:
+			raise TypeError('exported is a boolean property.')
+	
+	
+	###############
+	## Direction ##
+	###############
+	def configureAsOutput(self, initValue=None, inverted=False):
+		self.__reconfigureMonitoring()
+		
+		if isinstance(inverted, bool):
+			self.inverted = inverted
+		else if inverted is not None
+			raise TypeError('inverted has to be None, True or False.')
+		
+		if initValue is None:
+			self._direction = 'out'
+		else if initValue == True:
+			self._direction = 'high'
+		else if initValue == False:
+			self._direction = 'low'
+		else:
+			raise TypeError('initValue has to be None, True or False.')
+	
+	
+	def configureAsInput(self, cbRising=None, cbFalling=None):
+		if cbRising is None and cbFalling is None:
+			edge = 'none'
+		else if callable(cbRising) and cbFalling is None:
+			edge = 'rising'
+		else if cbRising is None and callable(cbFalling):
+			edge = 'falling'
+		else if callable(cbRising) and callable(cbFalling):
+			edge = 'both'
+		else
+			raise TypeError('The callbacks have to be None or a callable.')
+		
+		self.__reconfigureMonitoring()
+		
+		try:
+			with open(SYSFS_GPIO_EDGE_PATH % self.__nr, 'w') as f:
+				return f.write(edge)
+		
+		except FileNotFoundError:
+			if edge != 'none':
+				self.exportedOrFail()
+				raise Exception('GPIO #%d does not support callbacks.' % self.__nr)
+		
+		self._direction = 'in'
+		
+		self.__reconfigureMonitoring(cbRising, cbFalling)
 	
 	
 	@property
-	def direction(self):
-		return self._direction
+	def _direction(self):
+		try:
+			with open(SYSFS_GPIO_DIRECTION_PATH % self.__nr, 'r') as f:
+				return f.read()[:-1]
+		
+		except FileNotFoundError:
+			self.exportedOrFail()
+			raise Exception('GPIO #%d has a fixed direction. It can not be obtained.' % self.__nr)
+	
+	
+	@_direction.setter
+	def _direction(self, direction):
+		try:
+			with open(SYSFS_GPIO_DIRECTION_PATH % self.__nr, 'w') as f:
+				return f.write(direction)
+		
+		except FileNotFoundError:
+			self.exportedOrFail()
+			raise Exception('GPIO #%d has a fixed direction. It can not be changed.' % self.__nr)
+	
+	
+	@property
+	def isInput(self):
+		return self.direction == 'in'
+	
+	
+	@property
+	def isOutput(self):
+		return not self.isInput
+	
+	
+	###########
+	## Value ##
+	###########
+	def __assureValueFile(self):
+		if self.__valueFile is None:
+			self.__valueFile = open(SYSFS_GPIO_VALUE_PATH % self.__nr, 'r+')
+	
+	
+	def __closeValueFile(self):
+		if self.__valueFile is not None:
+			self.__reconfigureMonitoring()
+			
+			self.__valueFile.close()
+			self.__valueFile = None
 	
 	
 	@property
 	def value(self):
-		val = self._fd.read()
-		self._fd.seek(0)
-		return val == b'1\n'
+		self.__assureValueFile()
+		self.__valueFile.seek(0)
+		return self.__valueFile.read()[:-1] != '0'
 	
-	@callback.setter
+	
+	@value.setter
 	def value(self, value):
-		self._fd.write(SYSFS_GPIO_VALUE_HIGH if value else SYSFS_GPIO_VALUE_LOW)
-		self._fd.seek(0)
+		self.__assureValueFile()
+		self.__valueFile.seek(0)
+		
+		else if value == True:
+			self.__valueFile.write('1')
+		else if value == False:
+			self.__valueFile.write('0')
+		else:
+			raise TypeError('value has to be True or False')
 	
 	
+	################
+	## Active Low ##
+	################
 	@property
-	def number(self):
-		return self._number
+	def inverted(self):
+		with open(SYSFS_GPIO_ACTIVE_LOW_PATH % self.__nr, 'r') as f:
+			return f.read()[:-1] != '0'
 	
 	
+	@inverted.setter
+	def inverted(self, inverted):
+		with open(SYSFS_GPIO_ACTIVE_LOW_PATH % self.__nr, 'w') as f:
+			else if inverted == True:
+				f.write('1')
+			else if inverted == False:
+				f.write('0')
+			else:
+				raise TypeError('inverted has to be True or False')
+	
+	
+	################
+	## Monitoring ##
+	################
 	@property
-	def active_low(self):
-		return self._active_low
+	def currentEventLoop(self):
+		if self.__monitoring is None:
+			return None
+		else:
+			return self.__monitoring['eventLoop']
 	
 	
-	def fileno(self):
-		return self._fd.fileno()
+	def __reconfigureMonitoring(self, cbRising=None, cbFalling=None):
+		if self.__monitoring is not None:
+			self.__monitoring['eventLoop'].remove(self.__monitoring['token'])
+			self.__monitoring = None
+		
+		if cbRising is None and cbFalling is None:
+			return
+		
+		if self.eventLoop is None:
+			raise Exception('Can\'t monitor GPIO %d without event loop' % self.__nr)
+		
+		self.__assureValueFile()
+		token = self.eventLoop.add(self.__valueFile, self._interruptHandler)
+		
+		self.__monitoring = {
+			'token': token,
+			'eventLoop': self.eventLoop,
+			'cbRising': cbRising,
+			'cbFalling': cbFalling,
+		}
 	
 	
-	def changed(self, state):
-		if callable(self._callback):
-			self._callback(self.number, state)
+	def _interruptHandler(self):
+		if self.__monitoring is None:
+			return
+		
+		val = self.value
+		
+		if val and callable(self.__monitoring['cbRising']):
+			self.__monitoring['cbRising'](True)
+		else if not val and callable(self.__monitoring['cbFalling']):
+			self.__monitoring['cbFalling'](False)
 	
 	
-	#####################
-	## Private Methods ##
-	#####################
-	def _sysfs_gpio_value_path(self):
-		return SYSFS_GPIO_VALUE_PATH % self.number
 	
 	
-	def _sysfs_gpio_direction_path(self):
-		return SYSFS_GPIO_DIRECTION_PATH % self.number
-	
-	
-	def _sysfs_gpio_edge_path(self):
-		return SYSFS_GPIO_EDGE_PATH % self.number
-	
-	
-	def _sysfs_gpio_active_low_path(self):
-		return SYSFS_GPIO_ACTIVE_LOW_PATH % self.number
-
-
-
-class Controller(object):
-	def __new__(cls, *args, **kw):
-		if not hasattr(cls, '_instance'):
-			instance = super(Controller, cls).__new__(cls)
-			instance._allocated_pins = {}
-			instance._poll_queue = select.epoll()
+#class PinCollection(collections.abc.MutableMapping):
+	#def __new__(cls, *args, **kw):
+		#if not hasattr(cls, '_instance'):
+			#instance = super(Controller, cls).__new__(cls)
 			
-			instance._available_pins = []
-			instance._running = True
+			#instance.__pins = {}
 			
+			#cls._instance = instance
+		#return cls._instance
+	
+	
+	#def __init__(self):
+		#pass
+	
+	
+	#__setitem__(self, nr, pin):
+		#if nr in self.__pins:
+			#if self.__pins[nr] is pin:
+				#return
+			#else:
+				#del self[nr]
+		
+		#pin._associate(self, nr)
+		#self.__pins[nr] = pin
+	
+	
+	#__getitem__(self, nr):
+		#if nr not in self.__pins:
+			#if not isinstance(nr, int) or nr < 0:
+				#raise TypeError('Not a valid GPIO number')
+			
+			#self[nr] = Pin()
+			##else:
+				##raise KeyError()
+		
+		#return self.__pins[nr]
+	
+	
+	#__delitem__(self, nr):
+		#if not isinstance(nr, int) or nr < 0:
+			#raise TypeError('Not a valid GPIO number')
+		
+		#if nr not in self.__pins:
+			#raise KeyError()
+		
+		#pin._dissociate()
+		#del self.__pins[nr]
+		
+	
+	#__iter__(self):
+		#for pin in self.__pins:
+			#yield pin
+	
+	
+	#__len__(self):
+		#return len(self.__pins)
+		
+
+
+
+
+import errno
+import select
+from twisted.internet import reactor
+
+class TwistedLoop(object):
+			self._poll_queue = select.epoll()
 			# Cleanup before stopping reactor
-			reactor.addSystemEventTrigger('before', 'shutdown', instance.stop)
+			reactor.addSystemEventTrigger('before', 'shutdown', self.stop)
 			
 			# Run the EPoll in a Thread, as it blocks.
-			reactor.callInThread(instance._poll_queue_loop)
-			
-			cls._instance = instance
-		return cls._instance
+			reactor.callInThread(self._poll_queue_loop)
 	
-	def __init__(self):
-		pass
+	
+	def _poll_queue_register_pin(self, pin):
+		self._poll_queue.register(pin, (select.EPOLLPRI | select.EPOLLET))
+	
+	
+	def _poll_queue_unregister_pin(self, pin):
+		self._poll_queue.unregister(pin)
+	
 	
 	def _poll_queue_loop(self):
 		while self._running:
@@ -207,127 +400,6 @@ class Controller(object):
 				reactor.callFromThread(self._poll_queue_event, events)
 	
 	
-	@property
-	def available_pins(self):
-		return self._available_pins
-	
-	@available_pins.setter
-	def available_pins(self, value):
-		self._available_pins = value
-	
-	
-	def stop(self):
-		self._running = False
-		
-		try:
-			values = self._allocated_pins.copy().itervalues()
-		except AttributeError:
-			values = self._allocated_pins.copy().values()
-		for pin in values:
-			self.dealloc_pin(pin.number)
-	
-	
-	def alloc_pin(self, number, direction, callback=None, edge=None, active_low=0):
-		Logger.debug('SysfsGPIO: alloc_pin(%d, %s, %s, %s, %s)'
-		             % (number, direction, callback, edge, active_low))
-		
-		self._check_pin_validity(number)
-		
-		if direction not in DIRECTIONS:
-			raise Exception("Pin direction %s not in %s"
-			                % (direction, DIRECTIONS))
-		
-		if callback and edge not in EDGES:
-			raise Exception("Pin edge %s not in %s" % (edge, EDGES))
-		
-		if not self._check_pin_already_exported(number):
-			with open(SYSFS_EXPORT_PATH, 'w') as export:
-				export.write('%d' % number)
-		else:
-			Logger.debug("SysfsGPIO: Pin %d already exported" % number)
-		
-		pin = Pin(number, direction, callback, edge, active_low)
-		
-		if direction is INPUT:
-			self._poll_queue_register_pin(pin)
-		
-		self._allocated_pins[number] = pin
-		return pin
-	
-	
-	def _poll_queue_register_pin(self, pin):
-		self._poll_queue.register(pin, (select.EPOLLPRI | select.EPOLLET))
-	
-	
-	def _poll_queue_unregister_pin(self, pin):
-		self._poll_queue.unregister(pin)
-	
-	
-	def dealloc_pin(self, number):
-		Logger.debug('SysfsGPIO: dealloc_pin(%d)' % number)
-		
-		if number not in self._allocated_pins:
-			raise Exception('Pin %d not allocated' % number)
-		
-		with open(SYSFS_UNEXPORT_PATH, 'w') as unexport:
-			unexport.write('%d' % number)
-		
-		pin = self._allocated_pins[number]
-		
-		if pin.direction is INPUT:
-			self._poll_queue_unregister_pin(pin)
-		
-		del pin, self._allocated_pins[number]
-	
-	
-	def get_pin(self, number):
-		Logger.debug('SysfsGPIO: get_pin(%d)' % number)
-		return self._allocated_pins[number]
-	
-	
-	def set_pin(self, number):
-		Logger.debug('SysfsGPIO: set_pin(%d)' % number)
-		
-		if number not in self._allocated_pins:
-			raise Exception('Pin %d not allocated' % number)
-		
-		return self._allocated_pins[number].set()
-	
-	
-	def reset_pin(self, number):
-		Logger.debug('SysfsGPIO: reset_pin(%d)' % number)
-		
-		if number not in self._allocated_pins:
-			raise Exception('Pin %d not allocated' % number)
-		
-		return self._allocated_pins[number].reset()
-	
-	
-	def get_pin_state(self, number):
-		Logger.debug('SysfsGPIO: get_pin_state(%d)' % number)
-		
-		if number not in self._allocated_pins:
-			raise Exception('Pin %d not allocated' % number)
-		
-		pin = self._allocated_pins[number]
-		
-		if pin.direction == INPUT:
-			self._poll_queue_unregister_pin(pin)
-		
-		val = pin.read()
-		
-		if pin.direction == INPUT:
-			self._poll_queue_register_pin(pin)
-		
-		if val <= 0:
-			return False
-		else:
-			return True
-	
-	
-	#####################
-	## Private Methods ##
-	#####################
 	def _poll_queue_event(self, events):
 		for fd, event in events:
 			if not (event & (select.EPOLLPRI | select.EPOLLET)):
@@ -340,24 +412,11 @@ class Controller(object):
 			for pin in values:
 				if pin.fileno() == fd:
 					pin.changed(pin.read())
-	
-	
-	def _check_pin_already_exported(self, number):
-		gpio_path = SYSFS_GPIO_PATH % number
-		return os.path.isdir(gpio_path)
-	
-	
-	def _check_pin_validity(self, number):
-		if number not in self._available_pins:
-			raise Exception("Pin number out of range")
-		
-		if number in self._allocated_pins:
-			raise Exception("Pin already allocated")
 
 
 
 # Create controller instance
-Controller = Controller()
+pin = Controller()
 
 
 if __name__ == '__main__':
